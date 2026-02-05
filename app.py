@@ -10,7 +10,7 @@ import json
 import numpy as np
 
 # --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="DP Milclean - V21", layout="wide")
+st.set_page_config(page_title="DP Milclean - V22", layout="wide")
 
 st.markdown("""
 <style>
@@ -21,26 +21,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 0. CONSTANTES E UTILITÁRIOS
+# 0. COLUNAS FIXAS (ATUALIZADO COM CPF E PCD)
 # ==============================================================================
 COLUNAS_FIXAS = [
-    'ID', 'FLUIG', 'MATRICULA', 'NOME', 'LOCACAO', 'DIAS_RECESSO', 'PERIODO_RECESSO', 
-    'TIPO_DEMISSAO', 'DATA_DEMISSAO', 'TEM_CONSIGNADO', 'VALOR_CONSIGNADO', 
-    'CALCULO_REALIZADO', 'DOC_ENVIADO', 'DATA_PAGAMENTO', 'FATURAMENTO', 
-    'BAIXA_PAGAMENTO', 'OBSERVACOES', 'EXCLUIR'
+    'ID', 'FLUIG', 'MATRICULA', 'NOME', 'CPF', 'PCD', 'LOCACAO', 
+    'DIAS_RECESSO', 'PERIODO_RECESSO', 'TIPO_DEMISSAO', 'DATA_DEMISSAO', 
+    'TEM_CONSIGNADO', 'VALOR_CONSIGNADO', 'CALCULO_REALIZADO', 'DOC_ENVIADO', 
+    'DATA_PAGAMENTO', 'FATURAMENTO', 'BAIXA_PAGAMENTO', 'OBSERVACOES', 'EXCLUIR'
 ]
 
 SESSION_FILE = "user_session.json"
 
-# --- TRADUTORES (O Segredo do Excel bonito) ---
+# --- TRADUTORES ---
 def interpretar_booleano(valor):
-    """Lê do Google (Texto) -> Vira Checkbox (True/False)"""
     v = str(valor).upper().strip()
     positivos = ['TRUE', '1', 'SIM', 'OK', 'CALCULADO', 'ENVIADO', 'PAGO', 'POSSUI FATURAMENTO', 'MARCADO']
     return True if any(x in v for x in positivos) else False
 
 def formatar_para_texto(valor, tipo):
-    """Lê do Checkbox (True/False) -> Vira Texto Bonito (Para Excel/Google)"""
     if tipo == 'CALCULO': return "CALCULADO" if valor else "PENDENTE"
     if tipo == 'DOC': return "ENVIADO" if valor else "PENDENTE"
     if tipo == 'PAGTO': return "PAGO" if valor else "ABERTO"
@@ -49,7 +47,7 @@ def formatar_para_texto(valor, tipo):
     return str(valor)
 
 # ==============================================================================
-# 1. LOGIN E CONEXÃO (AQUI ESTÁ A CORREÇÃO DA NUVEM)
+# 1. LOGIN E SEGURANÇA
 # ==============================================================================
 def save_session(user):
     with open(SESSION_FILE, "w") as f: json.dump({"user": user, "ts": time.time()}, f)
@@ -78,31 +76,19 @@ if 'logado' not in st.session_state:
 @st.cache_resource
 def conectar_gsheets():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    
-    # 1. TENTA LER DA NUVEM (SECRETS)
     if "gcp_service_account" in st.secrets:
         try:
             creds_dict = dict(st.secrets["gcp_service_account"])
-            # Correção para chave privada com quebra de linha
-            if "private_key" in creds_dict:
-                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-            
+            if "private_key" in creds_dict: creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             return client.open("SistemaDP_DB")
-        except Exception as e:
-            st.error(f"Erro nos Segredos da Nuvem: {e}")
-            st.stop()
-
-    # 2. TENTA LER DO ARQUIVO LOCAL (PC)
+        except Exception as e: st.error(f"Erro Secrets: {e}"); st.stop()
     elif os.path.exists("credenciais.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credenciais.json", scope)
         client = gspread.authorize(creds)
         return client.open("SistemaDP_DB")
-        
-    else:
-        st.error("🚨 ERRO CRÍTICO: Não encontrei credenciais (Nem no arquivo local, nem nos Secrets da Nuvem).")
-        st.stop()
+    else: st.error("🚨 Credenciais não encontradas."); st.stop()
 
 def verificar_login(user, pwd):
     if user == "adm" and pwd == "123": return True
@@ -117,6 +103,18 @@ def verificar_login(user, pwd):
             if str(pwd) == str(achou.iloc[0]['SENHA']): return True
     except: pass
     return False
+
+# Função para derrubar usuário se ele foi excluído da planilha
+def validar_sessao_ativa():
+    if st.session_state['usuario_atual'] == 'adm': return True
+    try:
+        sh = conectar_gsheets()
+        ws = sh.worksheet("usuarios")
+        users = [str(u).upper() for u in ws.col_values(1)] # Coluna USUARIO
+        if str(st.session_state['usuario_atual']).upper() not in users:
+            return False # Usuário não existe mais na planilha
+    except: return True # Em caso de erro de conexão, mantém logado para não travar
+    return True
 
 if not st.session_state['logado']:
     st.markdown("## 🔒 DP Milclean")
@@ -134,8 +132,16 @@ if not st.session_state['logado']:
             else: st.error("Inválido")
     st.stop()
 
+# VERIFICAÇÃO DE SEGURANÇA (DERRUBAR USUÁRIO)
+if not validar_sessao_ativa():
+    clear_session()
+    st.session_state['logado'] = False
+    st.error("🚫 Sua sessão foi encerrada pelo Administrador.")
+    time.sleep(2)
+    st.rerun()
+
 # ==============================================================================
-# 2. CARREGAMENTO DE DADOS
+# 2. CARREGAMENTO DE DADOS (ATUALIZADO)
 # ==============================================================================
 def limpar_matricula(valor):
     if pd.isna(valor) or str(valor).strip() == "": return ""
@@ -148,10 +154,14 @@ def carregar_bases():
         try: return pd.DataFrame(sh.worksheet(nome).get_all_records())
         except: return pd.DataFrame()
 
+    # FUNCIONARIOS (AGORA COM CPF E PCD)
     df_f = ler("base_funcionarios")
     if not df_f.empty:
         df_f.columns = [str(c).upper().strip() for c in df_f.columns]
         if 'MATRICULA' in df_f: df_f['MATRICULA'] = df_f['MATRICULA'].apply(limpar_matricula)
+        # Garante que as colunas existam para não dar erro
+        if 'CPF' not in df_f: df_f['CPF'] = ""
+        if 'PCD' not in df_f: df_f['PCD'] = "NÃO"
 
     df_c = ler("base_consignados")
     if not df_c.empty:
@@ -176,21 +186,27 @@ def carregar_bases():
 def buscar_dados(mat):
     df_f, df_c, df_r = carregar_bases()
     m = limpar_matricula(mat)
-    nm, lc = "NOME MANUAL", "-"
+    
+    nm, lc, cpf, pcd = "NOME MANUAL", "-", "", "NÃO"
+    
     bf = df_f[df_f['MATRICULA'] == m]
     if not bf.empty:
         nm = bf.iloc[0].get('NOME', "Sem Nome")
         lc = bf.iloc[0].get('CENTRO_CUSTO', "-")
+        cpf = bf.iloc[0].get('CPF', "")
+        pcd = bf.iloc[0].get('PCD', "NÃO") # Puxa se é PCD
+        
     vc = 0.0
     bc = df_c[df_c['MATRICULA'] == m]
     if not bc.empty: vc = float(bc.iloc[0]['VALOR'])
+    
     dr, pr = 0, "-"
     br = df_r[df_r['MATRICULA'] == m]
     if not br.empty:
         dr = int(br.iloc[0]['DIAS'])
         di = br.iloc[0].get('PER_INI'); df = br.iloc[0].get('PER_FIM')
         if pd.notnull(di) and pd.notnull(df): pr = f"{di.strftime('%d/%m/%Y')} a {df.strftime('%d/%m/%Y')}"
-    return nm, lc, vc, dr, pr
+    return nm, lc, cpf, pcd, vc, dr, pr
 
 def registrar_log(acao, detalhes):
     try:
@@ -209,7 +225,7 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🚀 ABRIR SISTEMA ANTIGO"):
         try: subprocess.Popen(r"C:\SistemaAntigo\Emissor.exe"); st.toast("Abrindo...")
-        except: st.error("Erro exe")
+        except: st.error("Erro exe (funciona apenas local)")
     if st.button("🔄 FORÇAR RECARGA"):
         carregar_bases.clear(); st.cache_data.clear(); st.rerun()
     if st.button("Sair"):
@@ -221,13 +237,28 @@ if pagina == "Rescisões":
         st.header("➕ Novo")
         fluig = st.text_input("N° Fluig")
         mat = st.text_input("Matrícula").strip()
-        nm, lc, vc, dr, pr = "", "", 0.0, 0, ""
+        
+        # Variáveis de inicialização
+        nm, lc, cpf, pcd, vc, dr, pr = "", "", "", "NÃO", 0.0, 0, ""
+        
         if mat:
-            nm, lc, vc, dr, pr = buscar_dados(mat)
-            if nm != "NOME MANUAL": st.success(f"✅ {nm}"); st.caption(f"📍 {lc}")
-            else: st.warning("Nova Matrícula")
-            if dr > 0: st.info(f"🏖️ Recesso: {dr} dias")
+            nm, lc, cpf, pcd, vc, dr, pr = buscar_dados(mat)
+            if nm != "NOME MANUAL": 
+                st.success(f"✅ {nm}")
+                st.caption(f"📍 {lc}")
+                st.caption(f"🆔 CPF: {cpf}")
+                
+                # ALERTA DE PCD
+                if str(pcd).upper() == "SIM":
+                    st.error("♿ COLABORADOR PCD - ATENÇÃO!")
+                else:
+                    st.info("PCD: Não")
+            else: 
+                st.warning("Nova Matrícula (Manual)")
+                
+            if dr > 0: st.warning(f"🏖️ Recesso: {dr} dias")
             if vc > 0: st.error(f"⚠️ Consignado: R$ {vc}")
+            
         tipo = st.selectbox("Tipo", ["Aviso Trabalhado", "Aviso Indenizado", "Pedido de Demissão", "Término Contrato", "Acordo", "Rescisão Indireta"])
         dt_dem = st.date_input("Demissão", date.today(), format="DD/MM/YYYY")
         obs = st.text_area("Obs")
@@ -243,11 +274,10 @@ if pagina == "Rescisões":
                     except: nid = 1
                     
                     row = [
-                        nid, f"'{fluig}", limpar_matricula(mat), nm, lc, dr, pr, tipo, 
+                        nid, f"'{fluig}", limpar_matricula(mat), nm, cpf, pcd, lc, dr, pr, tipo, 
                         dt_dem.strftime('%Y-%m-%d'), "Sim" if vc>0 else "Não", str(vc).replace('.',','),
                         "PENDENTE", "PENDENTE", (dt_dem+timedelta(10)).strftime('%Y-%m-%d'), "NÃO", "ABERTO", str(obs), ""
                     ]
-                    
                     ws.append_row(row)
                     st.cache_data.clear(); st.success("SALVO!"); time.sleep(1); st.rerun()
                 except Exception as e: st.error(f"Erro: {e}")
@@ -269,7 +299,7 @@ if pagina == "Rescisões":
         if c not in df.columns: df[c] = ""
     df = df[COLUNAS_FIXAS]
 
-    # TRATAMENTO E TRADUÇÃO (LEITURA)
+    # TRATAMENTO
     if 'FLUIG' in df: df['FLUIG'] = df['FLUIG'].astype(str).str.replace("'", "")
     if 'MATRICULA' in df: df['MATRICULA'] = df['MATRICULA'].astype(str)
     for col in ['DATA_DEMISSAO', 'DATA_PAGAMENTO']:
@@ -279,7 +309,7 @@ if pagina == "Rescisões":
     for b in bools:
         df[b] = df[b].apply(interpretar_booleano)
 
-    # --- FILTROS ---
+    # FILTROS
     st.markdown("#### 🔍 Filtros")
     c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 2])
     with c1: f_st = st.selectbox("Status", ["Todos", "Pendentes Cálculo", "Pendentes Doc", "Pendentes Pagto"])
@@ -300,25 +330,19 @@ if pagina == "Rescisões":
         dfv = dfv[(dfv[col]>=di) & (dfv[col]<=dfim)]
     if busca: dfv = dfv[dfv.astype(str).apply(lambda x: x.str.contains(busca, case=False, na=False)).any(axis=1)]
 
-    # --- ALERTAS (VOLTARAM!) ---
+    # DASHBOARD
     p_calc = len(dfv[dfv['CALCULO_REALIZADO']==False])
     p_doc = len(dfv[dfv['DOC_ENVIADO']==False])
     p_pag = len(dfv[dfv['BAIXA_PAGAMENTO']==False])
 
-    if p_calc > 0: st.error(f"🚨 Atenção: **{p_calc}** cálculos pendentes na visualização!")
-    if p_doc > 0: st.warning(f"⚠️ Atenção: **{p_doc}** envios de documentos pendentes!")
-    if p_pag > 0: st.info(f"💰 Atenção: **{p_pag}** pagamentos em aberto!")
+    if p_calc > 0: st.error(f"🚨 **{p_calc}** cálculos pendentes!")
+    if p_doc > 0: st.warning(f"⚠️ **{p_doc}** envios pendentes!")
+    if p_pag > 0: st.info(f"💰 **{p_pag}** pagamentos abertos!")
 
-    # DASHBOARD
     st.divider()
     st.caption(f"👁️ Visualizando: **{len(dfv)} registros**")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total", len(dfv))
-    k2.metric("P. Cálculo", p_calc)
-    k3.metric("P. Doc", p_doc)
-    k4.metric("P. Pagto", p_pag)
     
-    # EDITOR
+    # EDITOR (Agora mostra CPF e PCD)
     df_editado = st.data_editor(
         dfv,
         key="ed",
@@ -330,6 +354,8 @@ if pagina == "Rescisões":
             "FLUIG": st.column_config.TextColumn("Fluig", width="small"),
             "MATRICULA": st.column_config.TextColumn("Matrícula", width="small"),
             "NOME": st.column_config.TextColumn(disabled=True),
+            "CPF": st.column_config.TextColumn("CPF", disabled=True), # NOVO
+            "PCD": st.column_config.TextColumn("PCD", disabled=True, width="small"), # NOVO
             "LOCACAO": st.column_config.TextColumn(disabled=True),
             "DIAS_RECESSO": st.column_config.NumberColumn(disabled=True, width="small"),
             "PERIODO_RECESSO": st.column_config.TextColumn(disabled=True),
@@ -364,19 +390,20 @@ if pagina == "Rescisões":
                     df_keep = df_g[~df_g['ID'].isin(ids_t)]
                     df_new = df_editado.copy()
                     
-                    # INTEGRIDADE
+                    # INTEGRIDADE (Atualiza PCD e CPF se mudou na base)
                     for i, r in df_new.iterrows():
-                        nm, lc, vc, dr, pr = buscar_dados(str(r['MATRICULA']))
+                        nm, lc, cpf, pcd, vc, dr, pr = buscar_dados(str(r['MATRICULA']))
                         if r['NOME'] != nm:
                             df_new.at[i, 'NOME'] = nm; df_new.at[i, 'LOCACAO'] = lc
+                            df_new.at[i, 'CPF'] = cpf; df_new.at[i, 'PCD'] = pcd # Atualiza campos novos
                             df_new.at[i, 'DIAS_RECESSO'] = dr; df_new.at[i, 'PERIODO_RECESSO'] = pr
                     
-                    # FORMATAÇÃO (VOLTA PARA TEXTO)
+                    # FORMATAÇÃO
                     if 'DATA_DEMISSAO' in df_new: df_new['DATA_DEMISSAO'] = df_new['DATA_DEMISSAO'].apply(lambda x: x.strftime('%Y-%m-%d') if x else "")
                     if 'DATA_PAGAMENTO' in df_new: df_new['DATA_PAGAMENTO'] = df_new['DATA_PAGAMENTO'].apply(lambda x: x.strftime('%Y-%m-%d') if x else "")
                     if 'FLUIG' in df_new: df_new['FLUIG'] = df_new['FLUIG'].astype(str).apply(lambda x: f"'{x}" if not str(x).startswith("'") else x)
 
-                    # --- TRADUÇÃO (TEXTO PARA PLANILHA) ---
+                    # TRADUÇÃO
                     if 'CALCULO_REALIZADO' in df_new: df_new['CALCULO_REALIZADO'] = df_new['CALCULO_REALIZADO'].apply(lambda x: formatar_para_texto(x, 'CALCULO'))
                     if 'DOC_ENVIADO' in df_new: df_new['DOC_ENVIADO'] = df_new['DOC_ENVIADO'].apply(lambda x: formatar_para_texto(x, 'DOC'))
                     if 'BAIXA_PAGAMENTO' in df_new: df_new['BAIXA_PAGAMENTO'] = df_new['BAIXA_PAGAMENTO'].apply(lambda x: formatar_para_texto(x, 'PAGTO'))
@@ -427,11 +454,7 @@ if pagina == "Rescisões":
                 if dn.button("CANCELAR"): st.session_state['confirm_del'] = False; st.rerun()
 
     with c_exp:
-        dx = df.copy() # Já está em booleanos, traduzimos agora pro excel
-        if 'CALCULO_REALIZADO' in dx: dx['CALCULO_REALIZADO'] = dx['CALCULO_REALIZADO'].apply(lambda x: formatar_para_texto(x, 'CALCULO'))
-        if 'DOC_ENVIADO' in dx: dx['DOC_ENVIADO'] = dx['DOC_ENVIADO'].apply(lambda x: formatar_para_texto(x, 'DOC'))
-        if 'BAIXA_PAGAMENTO' in dx: dx['BAIXA_PAGAMENTO'] = dx['BAIXA_PAGAMENTO'].apply(lambda x: formatar_para_texto(x, 'PAGTO'))
-        if 'FATURAMENTO' in dx: dx['FATURAMENTO'] = dx['FATURAMENTO'].apply(lambda x: formatar_para_texto(x, 'FAT'))
+        dx = df.copy()
         if 'DATA_DEMISSAO' in dx: dx['DATA_DEMISSAO'] = pd.to_datetime(dx['DATA_DEMISSAO']).dt.strftime('%d/%m/%Y')
         csv = dx.to_csv(sep=';', decimal=',', index=False, encoding='utf-8-sig').encode('utf-8-sig')
         st.download_button("📥 Excel", csv, "res.csv")
@@ -447,6 +470,19 @@ elif pagina == "Gestão Usuários":
             nu = st.text_input("Login"); ns = st.text_input("Senha")
             if st.form_submit_button("Criar"): ws_u.append_row([nu, ns]); st.success("Criado!")
     with c2:
-        st.subheader("Lista")
+        st.subheader("Usuários Ativos (Derrubar = Excluir)")
         d = ws_u.get_all_records()
-        for x in d: st.write(f"👤 {x.get('USUARIO') or x.get('usuario')}")
+        if d:
+            df_u = pd.DataFrame(d)
+            # Mostra Tabela com Senha
+            st.dataframe(df_u, use_container_width=True)
+            
+            # Botão para derrubar
+            user_del = st.selectbox("Selecionar para derrubar:", df_u['USUARIO'].tolist())
+            if st.button(f"🚫 DERRUBAR {user_del}"):
+                novos = df_u[df_u['USUARIO'] != user_del]
+                ws_u.clear()
+                ws_u.update([novos.columns.values.tolist()] + novos.values.tolist())
+                st.success(f"{user_del} derrubado! (Perderá acesso ao recarregar)")
+                time.sleep(1)
+                st.rerun()
