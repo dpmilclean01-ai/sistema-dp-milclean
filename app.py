@@ -10,7 +10,7 @@ import json
 import numpy as np
 
 # --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="DP Milclean - V20", layout="wide")
+st.set_page_config(page_title="DP Milclean - V21", layout="wide")
 
 st.markdown("""
 <style>
@@ -49,7 +49,7 @@ def formatar_para_texto(valor, tipo):
     return str(valor)
 
 # ==============================================================================
-# 1. LOGIN
+# 1. LOGIN E CONEXÃO (AQUI ESTÁ A CORREÇÃO DA NUVEM)
 # ==============================================================================
 def save_session(user):
     with open(SESSION_FILE, "w") as f: json.dump({"user": user, "ts": time.time()}, f)
@@ -79,21 +79,29 @@ if 'logado' not in st.session_state:
 def conectar_gsheets():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     
-    # TENTATIVA 1: Conexão via Segredos do Streamlit Cloud (NUVEM)
+    # 1. TENTA LER DA NUVEM (SECRETS)
     if "gcp_service_account" in st.secrets:
-        creds_dict = st.secrets["gcp_service_account"]
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(creds)
-        return client.open("SistemaDP_DB")
+        try:
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            # Correção para chave privada com quebra de linha
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            return client.open("SistemaDP_DB")
+        except Exception as e:
+            st.error(f"Erro nos Segredos da Nuvem: {e}")
+            st.stop()
 
-    # TENTATIVA 2: Conexão via Arquivo Local (SEU PC)
+    # 2. TENTA LER DO ARQUIVO LOCAL (PC)
     elif os.path.exists("credenciais.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credenciais.json", scope)
         client = gspread.authorize(creds)
         return client.open("SistemaDP_DB")
         
     else:
-        st.error("🚨 ERRO: Credenciais não encontradas (Nem segredos, nem arquivo JSON).")
+        st.error("🚨 ERRO CRÍTICO: Não encontrei credenciais (Nem no arquivo local, nem nos Secrets da Nuvem).")
         st.stop()
 
 def verificar_login(user, pwd):
@@ -239,6 +247,7 @@ if pagina == "Rescisões":
                         dt_dem.strftime('%Y-%m-%d'), "Sim" if vc>0 else "Não", str(vc).replace('.',','),
                         "PENDENTE", "PENDENTE", (dt_dem+timedelta(10)).strftime('%Y-%m-%d'), "NÃO", "ABERTO", str(obs), ""
                     ]
+                    
                     ws.append_row(row)
                     st.cache_data.clear(); st.success("SALVO!"); time.sleep(1); st.rerun()
                 except Exception as e: st.error(f"Erro: {e}")
@@ -260,20 +269,16 @@ if pagina == "Rescisões":
         if c not in df.columns: df[c] = ""
     df = df[COLUNAS_FIXAS]
 
-    # TRATAMENTO
+    # TRATAMENTO E TRADUÇÃO (LEITURA)
     if 'FLUIG' in df: df['FLUIG'] = df['FLUIG'].astype(str).str.replace("'", "")
     if 'MATRICULA' in df: df['MATRICULA'] = df['MATRICULA'].astype(str)
     for col in ['DATA_DEMISSAO', 'DATA_PAGAMENTO']:
         df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
     
-    # Interpretar Booleano (Texto -> Checkbox) para a TELA
     bools = ['CALCULO_REALIZADO', 'DOC_ENVIADO', 'BAIXA_PAGAMENTO', 'FATURAMENTO', 'EXCLUIR']
     for b in bools:
         df[b] = df[b].apply(interpretar_booleano)
 
-    # --- ÁREA DE ALERTAS (OS AVISOS VOLTARAM!) ---
-    # Calculando pendências globais (ou do filtro se preferir, aqui fiz do filtro atual para ser dinâmico)
-    
     # --- FILTROS ---
     st.markdown("#### 🔍 Filtros")
     c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 2])
@@ -295,12 +300,12 @@ if pagina == "Rescisões":
         dfv = dfv[(dfv[col]>=di) & (dfv[col]<=dfim)]
     if busca: dfv = dfv[dfv.astype(str).apply(lambda x: x.str.contains(busca, case=False, na=False)).any(axis=1)]
 
-    # --- ALERTAS (BASEADO NO FILTRO ATUAL) ---
+    # --- ALERTAS (VOLTARAM!) ---
     p_calc = len(dfv[dfv['CALCULO_REALIZADO']==False])
     p_doc = len(dfv[dfv['DOC_ENVIADO']==False])
     p_pag = len(dfv[dfv['BAIXA_PAGAMENTO']==False])
 
-    if p_calc > 0: st.error(f"🚨 Atenção: **{p_calc}** cálculos pendentes na visualização atual!")
+    if p_calc > 0: st.error(f"🚨 Atenção: **{p_calc}** cálculos pendentes na visualização!")
     if p_doc > 0: st.warning(f"⚠️ Atenção: **{p_doc}** envios de documentos pendentes!")
     if p_pag > 0: st.info(f"💰 Atenção: **{p_pag}** pagamentos em aberto!")
 
@@ -366,13 +371,12 @@ if pagina == "Rescisões":
                             df_new.at[i, 'NOME'] = nm; df_new.at[i, 'LOCACAO'] = lc
                             df_new.at[i, 'DIAS_RECESSO'] = dr; df_new.at[i, 'PERIODO_RECESSO'] = pr
                     
-                    # FORMATAÇÃO PARA GOOGLE (VOLTA PARA TEXTO)
+                    # FORMATAÇÃO (VOLTA PARA TEXTO)
                     if 'DATA_DEMISSAO' in df_new: df_new['DATA_DEMISSAO'] = df_new['DATA_DEMISSAO'].apply(lambda x: x.strftime('%Y-%m-%d') if x else "")
                     if 'DATA_PAGAMENTO' in df_new: df_new['DATA_PAGAMENTO'] = df_new['DATA_PAGAMENTO'].apply(lambda x: x.strftime('%Y-%m-%d') if x else "")
                     if 'FLUIG' in df_new: df_new['FLUIG'] = df_new['FLUIG'].astype(str).apply(lambda x: f"'{x}" if not str(x).startswith("'") else x)
 
-                    # --- AQUI ESTÁ A CORREÇÃO DO EXCEL E GOOGLE ---
-                    # Transforma Checkbox (True) em Texto ("CALCULADO") antes de subir
+                    # --- TRADUÇÃO (TEXTO PARA PLANILHA) ---
                     if 'CALCULO_REALIZADO' in df_new: df_new['CALCULO_REALIZADO'] = df_new['CALCULO_REALIZADO'].apply(lambda x: formatar_para_texto(x, 'CALCULO'))
                     if 'DOC_ENVIADO' in df_new: df_new['DOC_ENVIADO'] = df_new['DOC_ENVIADO'].apply(lambda x: formatar_para_texto(x, 'DOC'))
                     if 'BAIXA_PAGAMENTO' in df_new: df_new['BAIXA_PAGAMENTO'] = df_new['BAIXA_PAGAMENTO'].apply(lambda x: formatar_para_texto(x, 'PAGTO'))
@@ -422,15 +426,12 @@ if pagina == "Rescisões":
                     st.success("Feito!"); st.rerun()
                 if dn.button("CANCELAR"): st.session_state['confirm_del'] = False; st.rerun()
 
-    # EXPORTAR (COM CORREÇÃO DE TEXTO NO EXCEL)
     with c_exp:
-        dx = df.copy() # Pega o DF que já está traduzido para booleanos
-        # Mas queremos texto no Excel!
+        dx = df.copy() # Já está em booleanos, traduzimos agora pro excel
         if 'CALCULO_REALIZADO' in dx: dx['CALCULO_REALIZADO'] = dx['CALCULO_REALIZADO'].apply(lambda x: formatar_para_texto(x, 'CALCULO'))
         if 'DOC_ENVIADO' in dx: dx['DOC_ENVIADO'] = dx['DOC_ENVIADO'].apply(lambda x: formatar_para_texto(x, 'DOC'))
         if 'BAIXA_PAGAMENTO' in dx: dx['BAIXA_PAGAMENTO'] = dx['BAIXA_PAGAMENTO'].apply(lambda x: formatar_para_texto(x, 'PAGTO'))
         if 'FATURAMENTO' in dx: dx['FATURAMENTO'] = dx['FATURAMENTO'].apply(lambda x: formatar_para_texto(x, 'FAT'))
-
         if 'DATA_DEMISSAO' in dx: dx['DATA_DEMISSAO'] = pd.to_datetime(dx['DATA_DEMISSAO']).dt.strftime('%d/%m/%Y')
         csv = dx.to_csv(sep=';', decimal=',', index=False, encoding='utf-8-sig').encode('utf-8-sig')
         st.download_button("📥 Excel", csv, "res.csv")
