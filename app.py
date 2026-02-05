@@ -10,7 +10,7 @@ import json
 import numpy as np
 
 # --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="DP Milclean - V23", layout="wide")
+st.set_page_config(page_title="DP Milclean - V24", layout="wide")
 
 st.markdown("""
 <style>
@@ -23,6 +23,7 @@ st.markdown("""
 # ==============================================================================
 # 0. CONSTANTES E UTILITÁRIOS
 # ==============================================================================
+# A ordem aqui não importa mais para o salvar, pois usaremos nomes de colunas
 COLUNAS_FIXAS = [
     'ID', 'FLUIG', 'MATRICULA', 'NOME', 'CPF', 'PCD', 'LOCACAO', 
     'DIAS_RECESSO', 'PERIODO_RECESSO', 'TIPO_DEMISSAO', 'DATA_DEMISSAO', 
@@ -46,14 +47,10 @@ def formatar_para_texto(valor, tipo):
     if tipo == 'EXCLUIR': return "MARCADO" if valor else ""
     return str(valor)
 
-# --- CORREÇÃO DE DATAS (O FIX DA V23) ---
 def formatar_data_para_salvar(valor):
-    """Garante que a data vá para o Google no formato padrão YYYY-MM-DD"""
-    if pd.isna(valor) or valor == "" or valor is None:
-        return ""
-    if isinstance(valor, (date, datetime)):
-        return valor.strftime('%Y-%m-%d')
-    # Se já for string, tenta garantir o formato ou devolve ela mesma
+    """Garante YYYY-MM-DD para o Google"""
+    if pd.isna(valor) or valor == "" or valor is None: return ""
+    if isinstance(valor, (date, datetime)): return valor.strftime('%Y-%m-%d')
     return str(valor)
 
 # ==============================================================================
@@ -206,6 +203,13 @@ def buscar_dados(mat):
         if pd.notnull(di) and pd.notnull(df): pr = f"{di.strftime('%d/%m/%Y')} a {df.strftime('%d/%m/%Y')}"
     return nm, lc, cpf, pcd, vc, dr, pr
 
+def registrar_log(acao, detalhes):
+    try:
+        sh = conectar_gsheets()
+        ws = sh.worksheet("logs")
+        ws.append_row([datetime.now().strftime('%d/%m/%Y %H:%M:%S'), st.session_state['usuario_atual'], acao, detalhes])
+    except: pass
+
 # ==============================================================================
 # 3. INTERFACE
 # ==============================================================================
@@ -249,22 +253,68 @@ if pagina == "Rescisões":
                 try:
                     sh = conectar_gsheets()
                     ws = sh.worksheet("rescisões")
-                    try: 
-                        ids = ws.col_values(1)
-                        nid = max([int(x) for x in ids[1:] if str(x).isdigit()]) + 1
-                    except: nid = 1
                     
-                    row = [
-                        nid, f"'{fluig}", limpar_matricula(mat), nm, cpf, pcd, lc, dr, pr, tipo, 
-                        formatar_data_para_salvar(dt_dem), # CORREÇÃO DE DATA
-                        "Sim" if vc>0 else "Não", str(vc).replace('.',','),
-                        "PENDENTE", "PENDENTE", 
-                        formatar_data_para_salvar(dt_dem + timedelta(days=10)), # CORREÇÃO DE DATA PGMTO
-                        "NÃO", "ABERTO", str(obs), ""
-                    ]
-                    ws.append_row(row)
-                    st.cache_data.clear(); st.success("SALVO!"); time.sleep(1); st.rerun()
-                except Exception as e: st.error(f"Erro: {e}")
+                    # 1. Carrega o DF atual (Para garantir a ordem das colunas)
+                    dados_existentes = ws.get_all_records()
+                    if dados_existentes:
+                        df_atual = pd.DataFrame(dados_existentes)
+                        df_atual.columns = [str(c).upper().strip() for c in df_atual.columns]
+                        # Garante ID
+                        if 'ID' in df_atual.columns:
+                            lista_ids = pd.to_numeric(df_atual['ID'], errors='coerce').fillna(0).tolist()
+                            nid = int(max(lista_ids)) + 1 if lista_ids else 1
+                        else: nid = 1
+                    else:
+                        df_atual = pd.DataFrame(columns=COLUNAS_FIXAS)
+                        nid = 1
+
+                    # 2. Cria o registro novo como um dicionário (Blindagem contra ordem de colunas)
+                    novo_registro = {
+                        'ID': nid,
+                        'FLUIG': f"'{fluig}",
+                        'MATRICULA': limpar_matricula(mat),
+                        'NOME': nm,
+                        'CPF': cpf,
+                        'PCD': pcd,
+                        'LOCACAO': lc,
+                        'DIAS_RECESSO': dr,
+                        'PERIODO_RECESSO': pr,
+                        'TIPO_DEMISSAO': tipo,
+                        'DATA_DEMISSAO': formatar_data_para_salvar(dt_dem),
+                        'TEM_CONSIGNADO': "Sim" if vc > 0 else "Não",
+                        'VALOR_CONSIGNADO': str(vc).replace('.', ','),
+                        'CALCULO_REALIZADO': "PENDENTE",
+                        'DOC_ENVIADO': "PENDENTE",
+                        'DATA_PAGAMENTO': formatar_data_para_salvar(dt_dem + timedelta(days=10)),
+                        'FATURAMENTO': "NÃO",
+                        'BAIXA_PAGAMENTO': "ABERTO",
+                        'OBSERVACOES': str(obs),
+                        'EXCLUIR': ""
+                    }
+
+                    # 3. Adiciona ao DF e Salva tudo (Método Seguro)
+                    df_novo = pd.DataFrame([novo_registro])
+                    
+                    # Concatena
+                    df_final = pd.concat([df_atual, df_novo], ignore_index=True)
+                    
+                    # Garante que todas as colunas fixas existam e estejam na ordem certa
+                    for col in COLUNAS_FIXAS:
+                        if col not in df_final.columns:
+                            df_final[col] = ""
+                    
+                    df_final = df_final[COLUNAS_FIXAS] # Reordena para ficar perfeito
+                    
+                    # Limpeza final
+                    df_final = df_final.replace([np.inf, -np.inf, np.nan], "").fillna("")
+                    
+                    # Salva
+                    matriz_dados = [df_final.columns.values.tolist()] + df_final.astype(str).values.tolist()
+                    ws.clear()
+                    ws.update(matriz_dados)
+                    
+                    st.cache_data.clear(); st.success("SALVO COM SUCESSO!"); time.sleep(1); st.rerun()
+                except Exception as e: st.error(f"Erro ao salvar: {e}")
             else: st.error("Faltam dados")
 
     # --- TELA PRINCIPAL ---
@@ -287,9 +337,8 @@ if pagina == "Rescisões":
     if 'FLUIG' in df: df['FLUIG'] = df['FLUIG'].astype(str).str.replace("'", "")
     if 'MATRICULA' in df: df['MATRICULA'] = df['MATRICULA'].astype(str)
     
-    # --- CORREÇÃO DE LEITURA DE DATAS (O PULO DO GATO) ---
+    # CORREÇÃO DE LEITURA DE DATAS
     for col in ['DATA_DEMISSAO', 'DATA_PAGAMENTO']:
-        # dayfirst=True resolve a confusão 05/02 vs 02/05
         df[col] = pd.to_datetime(df[col], errors='coerce', dayfirst=True).dt.date
     
     bools = ['CALCULO_REALIZADO', 'DOC_ENVIADO', 'BAIXA_PAGAMENTO', 'FATURAMENTO', 'EXCLUIR']
@@ -385,7 +434,7 @@ if pagina == "Rescisões":
                             df_new.at[i, 'CPF'] = cpf; df_new.at[i, 'PCD'] = pcd
                             df_new.at[i, 'DIAS_RECESSO'] = dr; df_new.at[i, 'PERIODO_RECESSO'] = pr
                     
-                    # FORMATAÇÃO PARA SAVE (AQUI O SEGREDO DO SAVE)
+                    # FORMATAÇÃO
                     if 'DATA_DEMISSAO' in df_new: df_new['DATA_DEMISSAO'] = df_new['DATA_DEMISSAO'].apply(formatar_data_para_salvar)
                     if 'DATA_PAGAMENTO' in df_new: df_new['DATA_PAGAMENTO'] = df_new['DATA_PAGAMENTO'].apply(formatar_data_para_salvar)
                     if 'FLUIG' in df_new: df_new['FLUIG'] = df_new['FLUIG'].astype(str).apply(lambda x: f"'{x}" if not str(x).startswith("'") else x)
