@@ -10,7 +10,7 @@ import json
 import numpy as np
 
 # --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="DP Milclean - V25", layout="wide")
+st.set_page_config(page_title="DP Milclean - V26", layout="wide")
 
 st.markdown("""
 <style>
@@ -21,9 +21,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 0. CONSTANTES E UTILITÁRIOS
+# 0. CONSTANTES - ESTES NOMES DEVEM SER IGUAIS AOS DO GOOGLE SHEETS
 # ==============================================================================
-# Estes nomes DEVEM ser iguais aos da primeira linha do Google Sheets
 COLUNAS_FIXAS = [
     'ID', 'FLUIG', 'MATRICULA', 'NOME', 'CPF', 'PCD', 'LOCACAO', 
     'DIAS_RECESSO', 'PERIODO_RECESSO', 'TIPO_DEMISSAO', 'DATA_DEMISSAO', 
@@ -47,14 +46,15 @@ def formatar_para_texto(valor, tipo):
     if tipo == 'EXCLUIR': return "MARCADO" if valor else ""
     return str(valor)
 
+# --- CORREÇÃO DEFINITIVA DA DATA (BR) ---
 def formatar_data_para_salvar(valor):
-    """Garante YYYY-MM-DD string para o Google"""
+    """Envia DD/MM/YYYY como TEXTO para o Google não bugar"""
     if pd.isna(valor) or valor == "" or valor is None: return ""
-    if isinstance(valor, (date, datetime)): return valor.strftime('%Y-%m-%d')
-    return str(valor) # Se já for texto, retorna texto
+    if isinstance(valor, (date, datetime)): return valor.strftime('%d/%m/%Y')
+    return str(valor)
 
 # ==============================================================================
-# 1. LOGIN E SEGURANÇA
+# 1. LOGIN
 # ==============================================================================
 def save_session(user):
     with open(SESSION_FILE, "w") as f: json.dump({"user": user, "ts": time.time()}, f)
@@ -247,19 +247,22 @@ if pagina == "Rescisões":
                     sh = conectar_gsheets()
                     ws = sh.worksheet("rescisões")
                     
-                    # 1. Pega os cabeçalhos reais da planilha (Linha 1)
-                    cabecalhos = ws.row_values(1)
-                    cabecalhos_upper = [str(c).upper().strip() for c in cabecalhos]
+                    # 1. PEGA CABEÇALHOS REAIS DO GOOGLE
+                    headers_planilha = [str(h).upper().strip() for h in ws.row_values(1)]
                     
-                    # 2. Calcula ID novo
+                    # 2. Gera ID
                     try:
-                        col_id_idx = cabecalhos_upper.index("ID") + 1
+                        col_id_idx = headers_planilha.index("ID") + 1
                         ids = ws.col_values(col_id_idx)
-                        nid = max([int(x) for x in ids[1:] if str(x).isdigit()]) + 1
+                        # Filtra apenas números
+                        valid_ids = []
+                        for x in ids[1:]:
+                            if str(x).isdigit(): valid_ids.append(int(x))
+                        nid = max(valid_ids) + 1 if valid_ids else 1
                     except: nid = 1
                     
-                    # 3. Monta dicionário com os dados
-                    dados = {
+                    # 3. CRIA O DICIONARIO DE DADOS (COM DATA BR)
+                    dados_registro = {
                         'ID': nid,
                         'FLUIG': f"'{fluig}",
                         'MATRICULA': limpar_matricula(mat),
@@ -270,30 +273,31 @@ if pagina == "Rescisões":
                         'DIAS_RECESSO': dr,
                         'PERIODO_RECESSO': pr,
                         'TIPO_DEMISSAO': tipo,
-                        'DATA_DEMISSAO': formatar_data_para_salvar(dt_dem), # DATA FORMATADA
+                        'DATA_DEMISSAO': formatar_data_para_salvar(dt_dem), # AQUI VAI COMO DD/MM/AAAA
                         'TEM_CONSIGNADO': "Sim" if vc > 0 else "Não",
                         'VALOR_CONSIGNADO': str(vc).replace('.', ','),
                         'CALCULO_REALIZADO': "PENDENTE",
                         'DOC_ENVIADO': "PENDENTE",
-                        'DATA_PAGAMENTO': formatar_data_para_salvar(dt_dem + timedelta(days=10)), # DATA PGMTO FORMATADA
+                        'DATA_PAGAMENTO': formatar_data_para_salvar(dt_dem + timedelta(days=10)),
                         'FATURAMENTO': "NÃO",
                         'BAIXA_PAGAMENTO': "ABERTO",
                         'OBSERVACOES': str(obs),
                         'EXCLUIR': ""
                     }
                     
-                    # 4. Mapeia os dados para a ordem exata das colunas da planilha
-                    linha_para_salvar = []
-                    for col_planilha in cabecalhos_upper:
-                        # Pega o valor do dicionário. Se não tiver, manda vazio.
-                        valor = dados.get(col_planilha, "")
-                        linha_para_salvar.append(valor)
+                    # 4. MAPEIA OS DADOS PARA AS COLUNAS REAIS DA PLANILHA
+                    linha_final = []
+                    for coluna in headers_planilha:
+                        # Se o nome da coluna no Excel existir no nosso dicionário, pega o valor
+                        # Se não, manda vazio
+                        valor = dados_registro.get(coluna, "")
+                        linha_final.append(valor)
                     
-                    # 5. Salva (Append Row)
-                    ws.append_row(linha_para_salvar)
+                    # 5. SALVA
+                    ws.append_row(linha_final)
                     
-                    st.cache_data.clear(); st.success("SALVO COM DATA CORRETA!"); time.sleep(1); st.rerun()
-                except Exception as e: st.error(f"Erro ao salvar: {e} - Verifique os nomes das colunas na planilha!")
+                    st.cache_data.clear(); st.success("SALVO!"); time.sleep(1); st.rerun()
+                except Exception as e: st.error(f"Erro: {e} - Verifique se a coluna DATA_DEMISSAO existe na planilha.")
             else: st.error("Faltam dados")
 
     # --- TELA PRINCIPAL ---
@@ -309,12 +313,11 @@ if pagina == "Rescisões":
     # Normalização
     df.columns = [str(c).upper().strip() for c in df.columns]
     
-    # TRATAMENTO DE DATAS PARA EXIBIÇÃO
-    # Converte strings 'YYYY-MM-DD' para objetos Date que o editor entende
+    # TRATAMENTO DE DATAS (LEITURA)
     for col in ['DATA_DEMISSAO', 'DATA_PAGAMENTO']:
         if col in df.columns:
-            # dayfirst=False pq estamos salvando como YYYY-MM-DD (ISO)
-            df[col] = pd.to_datetime(df[col], errors='coerce').dt.date
+            # dayfirst=True para ler DD/MM/AAAA corretamente
+            df[col] = pd.to_datetime(df[col], errors='coerce', dayfirst=True).dt.date
 
     # TRATAMENTO GERAL
     if 'FLUIG' in df: df['FLUIG'] = df['FLUIG'].astype(str).str.replace("'", "")
@@ -415,7 +418,7 @@ if pagina == "Rescisões":
                             df_new.at[i, 'CPF'] = cpf; df_new.at[i, 'PCD'] = pcd
                             df_new.at[i, 'DIAS_RECESSO'] = dr; df_new.at[i, 'PERIODO_RECESSO'] = pr
                     
-                    # FORMATAÇÃO
+                    # FORMATAÇÃO (DATA BR NO UPDATE TB)
                     if 'DATA_DEMISSAO' in df_new: df_new['DATA_DEMISSAO'] = df_new['DATA_DEMISSAO'].apply(formatar_data_para_salvar)
                     if 'DATA_PAGAMENTO' in df_new: df_new['DATA_PAGAMENTO'] = df_new['DATA_PAGAMENTO'].apply(formatar_data_para_salvar)
                     if 'FLUIG' in df_new: df_new['FLUIG'] = df_new['FLUIG'].astype(str).apply(lambda x: f"'{x}" if not str(x).startswith("'") else x)
@@ -432,8 +435,7 @@ if pagina == "Rescisões":
                     df_fin['ID'] = pd.to_numeric(df_fin['ID'], errors='coerce').fillna(0).astype(int)
                     df_fin = df_fin.sort_values('ID')
                     
-                    # Garante que salva apenas as colunas que existem na planilha para não dar erro
-                    # Mas precisamos garantir que as fixas existam
+                    # Ordena colunas
                     cols_para_salvar = [c for c in COLUNAS_FIXAS if c in df_fin.columns]
                     df_fin = df_fin[cols_para_salvar]
                     
@@ -463,7 +465,11 @@ if pagina == "Rescisões":
                     df_g.columns = [str(c).upper().strip() for c in df_g.columns]
                     ids = to_del['ID'].tolist()
                     fin = df_g[~df_g['ID'].isin(ids)]
-                    fin = fin.replace([np.inf, -np.inf, np.nan], "").fillna("")
+                    
+                    # Garante que colunas existem
+                    valid_cols = [c for c in COLUNAS_FIXAS if c in fin.columns]
+                    fin = fin[valid_cols].replace([np.inf, -np.inf, np.nan], "").fillna("")
+                    
                     matriz = [fin.columns.values.tolist()] + fin.astype(str).values.tolist()
                     ws_res.clear(); ws_res.update(matriz)
                     st.cache_data.clear(); st.session_state['confirm_del'] = False
