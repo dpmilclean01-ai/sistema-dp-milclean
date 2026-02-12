@@ -1,509 +1,729 @@
 import streamlit as st
+
+st.set_page_config(page_title="Controle de Cartões", layout="wide")
+
+import psycopg2
 import pandas as pd
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import date, datetime, timedelta
+from datetime import datetime
 import os
-import time
-import subprocess
-import json
-import numpy as np
+from streamlit_cookies_manager import EncryptedCookieManager
+from psycopg2.extras import execute_batch
 
-# --- CONFIGURAÇÃO VISUAL ---
-st.set_page_config(page_title="DP Milclean - V26", layout="wide")
-
-st.markdown("""
-<style>
-    .stButton button { width: 100%; font-weight: bold; border-radius: 5px; }
-    [data-testid="stMetricValue"] { font-size: 24px; font-weight: bold; }
-    .stAlert { padding: 0.5rem; border-radius: 5px; margin-bottom: 10px; }
-</style>
-""", unsafe_allow_html=True)
-
-# ==============================================================================
-# 0. CONSTANTES - ESTES NOMES DEVEM SER IGUAIS AOS DO GOOGLE SHEETS
-# ==============================================================================
-COLUNAS_FIXAS = [
-    'ID', 'FLUIG', 'MATRICULA', 'NOME', 'CPF', 'PCD', 'LOCACAO', 
-    'DIAS_RECESSO', 'PERIODO_RECESSO', 'TIPO_DEMISSAO', 'DATA_DEMISSAO', 
-    'TEM_CONSIGNADO', 'VALOR_CONSIGNADO', 'CALCULO_REALIZADO', 'DOC_ENVIADO', 
-    'DATA_PAGAMENTO', 'FATURAMENTO', 'BAIXA_PAGAMENTO', 'OBSERVACOES', 'EXCLUIR'
-]
-
-SESSION_FILE = "user_session.json"
-
-# --- TRADUTORES ---
-def interpretar_booleano(valor):
-    v = str(valor).upper().strip()
-    positivos = ['TRUE', '1', 'SIM', 'OK', 'CALCULADO', 'ENVIADO', 'PAGO', 'POSSUI FATURAMENTO', 'MARCADO']
-    return True if any(x in v for x in positivos) else False
-
-def formatar_para_texto(valor, tipo):
-    if tipo == 'CALCULO': return "CALCULADO" if valor else "PENDENTE"
-    if tipo == 'DOC': return "ENVIADO" if valor else "PENDENTE"
-    if tipo == 'PAGTO': return "PAGO" if valor else "ABERTO"
-    if tipo == 'FAT': return "POSSUI FATURAMENTO" if valor else "NÃO"
-    if tipo == 'EXCLUIR': return "MARCADO" if valor else ""
-    return str(valor)
-
-# --- CORREÇÃO DEFINITIVA DA DATA (BR) ---
-def formatar_data_para_salvar(valor):
-    """Envia DD/MM/YYYY como TEXTO para o Google não bugar"""
-    if pd.isna(valor) or valor == "" or valor is None: return ""
-    if isinstance(valor, (date, datetime)): return valor.strftime('%d/%m/%Y')
-    return str(valor)
-
-# ==============================================================================
-# 1. LOGIN
-# ==============================================================================
-def save_session(user):
-    with open(SESSION_FILE, "w") as f: json.dump({"user": user, "ts": time.time()}, f)
-
-def load_session():
-    if os.path.exists(SESSION_FILE):
-        try:
-            with open(SESSION_FILE, "r") as f:
-                data = json.load(f)
-                if time.time() - data.get("ts", 0) < 86400: return data.get("user")
-        except: pass
-    return None
-
-def clear_session():
-    if os.path.exists(SESSION_FILE): os.remove(SESSION_FILE)
-
-if 'logado' not in st.session_state:
-    saved = load_session()
-    if saved:
-        st.session_state['logado'] = True
-        st.session_state['usuario_atual'] = saved
-    else:
-        st.session_state['logado'] = False
-        st.session_state['usuario_atual'] = ''
-
-@st.cache_resource
-def conectar_gsheets():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    if "gcp_service_account" in st.secrets:
-        try:
-            creds_dict = dict(st.secrets["gcp_service_account"])
-            if "private_key" in creds_dict: creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            client = gspread.authorize(creds)
-            return client.open("SistemaDP_DB")
-        except Exception as e: st.error(f"Erro Secrets: {e}"); st.stop()
-    elif os.path.exists("credenciais.json"):
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credenciais.json", scope)
-        client = gspread.authorize(creds)
-        return client.open("SistemaDP_DB")
-    else: st.error("🚨 Credenciais não encontradas."); st.stop()
-
-def verificar_login(user, pwd):
-    if user == "adm" and pwd == "123": return True
+def formatar_data(valor):
+    if pd.isna(valor) or valor == "":
+        return None
     try:
-        sh = conectar_gsheets()
-        ws = sh.worksheet("usuarios")
-        df = pd.DataFrame(ws.get_all_records())
-        df = df.astype(str)
-        df.columns = [str(c).upper().strip() for c in df.columns]
-        achou = df[df['USUARIO'] == str(user)]
-        if not achou.empty:
-            if str(pwd) == str(achou.iloc[0]['SENHA']): return True
-    except: pass
-    return False
+        return pd.to_datetime(valor, dayfirst=True).strftime("%d-%m-%Y")
+    except:
+        return None
 
-def validar_sessao_ativa():
-    if st.session_state['usuario_atual'] == 'adm': return True
-    try:
-        sh = conectar_gsheets()
-        ws = sh.worksheet("usuarios")
-        users = [str(u).upper() for u in ws.col_values(1)]
-        if str(st.session_state['usuario_atual']).upper() not in users: return False
-    except: return True
-    return True
+# -------------------------
+# CONEXÃO BANCO
+# -------------------------
 
-if not st.session_state['logado']:
-    st.markdown("## 🔒 DP Milclean")
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        u = st.text_input("Usuário")
-        p = st.text_input("Senha", type="password")
-        manter = st.checkbox("Mantenha-me conectado")
-        if st.button("Entrar"):
-            if verificar_login(u, p):
-                st.session_state['logado'] = True
-                st.session_state['usuario_atual'] = u
-                if manter: save_session(u)
-                st.rerun()
-            else: st.error("Inválido")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    st.error("DATABASE_URL não encontrada.")
     st.stop()
 
-if not validar_sessao_ativa():
-    clear_session(); st.session_state['logado'] = False
-    st.error("🚫 Sessão encerrada."); time.sleep(2); st.rerun()
+conn = psycopg2.connect(DATABASE_URL)
+cursor = conn.cursor()
 
-# ==============================================================================
-# 2. CARREGAMENTO DE DADOS
-# ==============================================================================
-def limpar_matricula(valor):
-    if pd.isna(valor) or str(valor).strip() == "": return ""
-    return str(valor).strip().replace('.0', '')
+# -------------------------
+# COOKIES
+# -------------------------
 
-@st.cache_data(ttl=60, show_spinner="Lendo bases...")
-def carregar_bases():
-    sh = conectar_gsheets()
-    def ler(nome):
-        try: return pd.DataFrame(sh.worksheet(nome).get_all_records())
-        except: return pd.DataFrame()
+cookies = EncryptedCookieManager(
+    prefix="controle_cartoes_",
+    password="senha_super_secreta"
+)
 
-    df_f = ler("base_funcionarios")
-    if not df_f.empty:
-        df_f.columns = [str(c).upper().strip() for c in df_f.columns]
-        if 'MATRICULA' in df_f: df_f['MATRICULA'] = df_f['MATRICULA'].apply(limpar_matricula)
-        if 'CPF' not in df_f: df_f['CPF'] = ""
-        if 'PCD' not in df_f: df_f['PCD'] = "NÃO"
+if not cookies.ready():
+    st.stop()
 
-    df_c = ler("base_consignados")
-    if not df_c.empty:
-        df_c.columns = [str(c).upper().strip() for c in df_c.columns]
-        if 'MATRICULA' in df_c: df_c['MATRICULA'] = df_c['MATRICULA'].apply(limpar_matricula)
-        if 'VALOR' in df_c: df_c['VALOR'] = pd.to_numeric(df_c['VALOR'], errors='coerce').fillna(0)
-        df_c = df_c.groupby('MATRICULA')['VALOR'].sum().reset_index()
+# -------------------------
+# CRIAÇÃO TABELAS
+# -------------------------
 
-    df_r = ler("base_recesso")
-    if not df_r.empty:
-        df_r.columns = [str(c).upper().strip() for c in df_r.columns]
-        if 'MATRICULA' in df_r: df_r['MATRICULA'] = df_r['MATRICULA'].apply(limpar_matricula)
-        if 'DIAS' in df_r:
-            df_r['DIAS'] = df_r['DIAS'].astype(str).apply(lambda x: x.split(',')[0].split('.')[0])
-            df_r['DIAS'] = pd.to_numeric(df_r['DIAS'], errors='coerce').fillna(0).astype(int)
-        for col in ['PER_INI', 'PER_FIM']:
-            if col in df_r: df_r[col] = pd.to_datetime(df_r[col], errors='coerce')
-        df_r = df_r.drop_duplicates(subset=['MATRICULA'])
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS base_colaboradores (
+    id SERIAL PRIMARY KEY,
+    matricula TEXT UNIQUE,
+    nome TEXT,
+    contrato TEXT,
+    responsavel TEXT,
+    data_admissao TEXT,
+    data_demissao TEXT,
+    sit_folha TEXT,
+    ultima_atualizacao TEXT
+)
+""")
 
-    return df_f, df_c, df_r
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS meses (
+    id SERIAL PRIMARY KEY,
+    mes_referencia TEXT UNIQUE
+)
+""")
 
-def buscar_dados(mat):
-    df_f, df_c, df_r = carregar_bases()
-    m = limpar_matricula(mat)
-    nm, lc, cpf, pcd = "NOME MANUAL", "-", "", "NÃO"
-    bf = df_f[df_f['MATRICULA'] == m]
-    if not bf.empty:
-        nm = bf.iloc[0].get('NOME', "Sem Nome")
-        lc = bf.iloc[0].get('CENTRO_CUSTO', "-")
-        cpf = bf.iloc[0].get('CPF', "")
-        pcd = bf.iloc[0].get('PCD', "NÃO")
-    vc = 0.0
-    bc = df_c[df_c['MATRICULA'] == m]
-    if not bc.empty: vc = float(bc.iloc[0]['VALOR'])
-    dr, pr = 0, "-"
-    br = df_r[df_r['MATRICULA'] == m]
-    if not br.empty:
-        dr = int(br.iloc[0]['DIAS'])
-        di = br.iloc[0].get('PER_INI'); df = br.iloc[0].get('PER_FIM')
-        if pd.notnull(di) and pd.notnull(df): pr = f"{di.strftime('%d/%m/%Y')} a {df.strftime('%d/%m/%Y')}"
-    return nm, lc, cpf, pcd, vc, dr, pr
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS caixas (
+    id SERIAL PRIMARY KEY,
+    numero_caixa TEXT,
+    mes_id INTEGER,
+    localizacao TEXT
+)
+""")
 
-# ==============================================================================
-# 3. INTERFACE
-# ==============================================================================
-with st.sidebar:
-    st.write(f"👤 **{st.session_state['usuario_atual']}**")
-    pagina = "Rescisões"
-    if st.session_state['usuario_atual'] == 'adm': pagina = st.radio("Menu", ["Rescisões", "Gestão Usuários"])
-    st.markdown("---")
-    if st.button("🚀 ABRIR SISTEMA ANTIGO"):
-        try: subprocess.Popen(r"C:\SistemaAntigo\Emissor.exe"); st.toast("Abrindo...")
-        except: st.error("Erro exe local")
-    if st.button("🔄 FORÇAR RECARGA"):
-        carregar_bases.clear(); st.cache_data.clear(); st.rerun()
-    if st.button("Sair"):
-        clear_session(); st.session_state['logado'] = False; st.rerun()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS cartoes_ponto (
+    id SERIAL PRIMARY KEY,
+    matricula TEXT,
+    caixa_id INTEGER,
+    mes_id INTEGER,
+    data_registro TEXT,
+    UNIQUE (matricula, mes_id)
+)
+""")
 
-if pagina == "Rescisões":
-    # --- CADASTRO ---
-    with st.sidebar:
-        st.header("➕ Novo")
-        fluig = st.text_input("N° Fluig")
-        mat = st.text_input("Matrícula").strip()
-        nm, lc, cpf, pcd, vc, dr, pr = "", "", "", "NÃO", 0.0, 0, ""
-        if mat:
-            nm, lc, cpf, pcd, vc, dr, pr = buscar_dados(mat)
-            if nm != "NOME MANUAL": 
-                st.success(f"✅ {nm}"); st.caption(f"📍 {lc}")
-                st.caption(f"🆔 {cpf}")
-                if str(pcd).upper() == "SIM": st.error("♿ PCD: SIM")
-                else: st.info("PCD: NÃO")
-            else: st.warning("Nova Matrícula")
-            if dr > 0: st.warning(f"🏖️ Recesso: {dr} dias")
-            if vc > 0: st.error(f"⚠️ Consignado: R$ {vc}")
-            
-        tipo = st.selectbox("Tipo", ["Aviso Trabalhado", "Aviso Indenizado", "Pedido de Demissão", "Término Contrato", "Acordo", "Rescisão Indireta"])
-        dt_dem = st.date_input("Demissão", date.today(), format="DD/MM/YYYY")
-        obs = st.text_area("Obs")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS usuarios (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE,
+    password TEXT,
+    perfil TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS logs (
+    id SERIAL PRIMARY KEY,
+    usuario TEXT,
+    acao TEXT,
+    detalhe TEXT,
+    data TEXT
+)
+""")
+
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_base_matricula ON base_colaboradores(matricula)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_mes ON cartoes_ponto(mes_id)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_cartoes_matricula ON cartoes_ponto(matricula)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_caixas_mes ON caixas(mes_id)")
+
+conn.commit()
+
+# -------------------------
+# USUÁRIO ADMIN PADRÃO
+# -------------------------
+
+cursor.execute("SELECT * FROM usuarios WHERE username = %s", ("adm",))
+usuario_admin = cursor.fetchone()
+
+if not usuario_admin:
+    cursor.execute("""
+        INSERT INTO usuarios (username, password, perfil)
+        VALUES (%s,%s,%s)
+    """, ("adm", "123", "admin"))
+    conn.commit()
+
+# -------------------------
+# SESSÃO
+# -------------------------
+
+if "usuario_logado" not in st.session_state:
+    st.session_state.usuario_logado = None
+    st.session_state.perfil = None
+
+# -------------------------
+# AUTO LOGIN
+# -------------------------
+
+if st.session_state.usuario_logado is None:
+    user_cookie = cookies.get("usuario")
+
+    if user_cookie:
+        cursor.execute(
+            "SELECT * FROM usuarios WHERE username=%s",
+            (user_cookie,)
+        )
+        usuario = cursor.fetchone()
+
+        if usuario:
+            st.session_state.usuario_logado = usuario[1]
+            st.session_state.perfil = usuario[3]
+
+# -------------------------
+# LOGIN
+# -------------------------
+
+if st.session_state.usuario_logado is None:
+
+    st.title("🔐 Login do Sistema")
+
+    user = st.text_input("Usuário")
+    senha = st.text_input("Senha", type="password")
+    manter = st.checkbox("Manter conectado")
+
+    if st.button("Entrar"):
+
+        cursor.execute(
+            "SELECT * FROM usuarios WHERE username=%s AND password=%s",
+            (user, senha)
+        )
+        usuario = cursor.fetchone()
+
+        if usuario:
+            st.session_state.usuario_logado = usuario[1]
+            st.session_state.perfil = usuario[3]
+
+            if manter:
+                cookies["usuario"] = usuario[1]
+                cookies.save()
+
+            st.success("Login realizado!")
+            st.rerun()
+        else:
+            st.error("Usuário ou senha inválidos.")
+
+    st.stop()
+# -------------------------
+# MENU
+# -------------------------
+
+menu = st.sidebar.radio("Menu", [
+    "Importar Base Excel",
+    "Visualizar Base",
+    "Gestão de Caixas",
+    "Consultar Arquivamentos",
+    "Auditoria",
+    "Gestão de Usuários"
+])
+if st.sidebar.button("🚪 Sair"):
+    st.session_state.usuario_logado = None
+    st.session_state.perfil = None
+    cookies["usuario"] = ""
+    cookies.save()
+    st.rerun()
+# -------------------------
+# IMPORTAÇÃO
+# -------------------------
+
+if menu == "Importar Base Excel":
+    if st.session_state.perfil != "admin":
+        st.error("Apenas administradores podem alterar a base.")
+        st.stop()
+
+    st.header("📊 Importar / Atualizar Base de Colaboradores")
+
+    st.info("⚠ Datas devem estar no formato DD-MM-YYYY")
+
+    arquivo = st.file_uploader("Envie a planilha (.xlsx)", type=["xlsx"])
+
+    if arquivo is not None:
+
+        try:
+            df = pd.read_excel(arquivo, dtype=str)
+        except:
+            st.error("Erro ao ler o arquivo.")
+            st.stop()
+
+        df.columns = df.columns.str.strip().str.lower()
+
+        obrigatorias = [
+            "matricula", "nome", "contrato", "responsavel",
+            "data_admissao", "data_demissao", "sit_folha"
+        ]
+
+        if not all(col in df.columns for col in obrigatorias):
+            st.error("❌ A planilha não está no formato correto.")
+            st.write("Colunas obrigatórias:", obrigatorias)
+            st.stop()
+
+        inseridos = 0
+        atualizados = 0
+
+        from psycopg2.extras import execute_batch
+
+        registros = []
+
+        for _, row in df.iterrows():
+
+            matricula = str(row["matricula"]).strip()
+
+            data_adm = formatar_data(row["data_admissao"])
+            data_dem = formatar_data(row["data_demissao"])
+
+            registros.append((
+                matricula,
+                row["nome"],
+                row["contrato"],
+                row["responsavel"],
+                data_adm,
+                data_dem,
+                row["sit_folha"],
+                datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+            ))
+
+        query = """
+        INSERT INTO base_colaboradores
+        (matricula, nome, contrato, responsavel,
+        data_admissao, data_demissao, sit_folha, ultima_atualizacao)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (matricula)
+        DO UPDATE SET
+            nome = EXCLUDED.nome,
+            contrato = EXCLUDED.contrato,
+            responsavel = EXCLUDED.responsavel,
+            data_admissao = EXCLUDED.data_admissao,
+            data_demissao = EXCLUDED.data_demissao,
+            sit_folha = EXCLUDED.sit_folha,
+            ultima_atualizacao = EXCLUDED.ultima_atualizacao
+        """
+
+        execute_batch(cursor, query, registros, page_size=1000)
+        conn.commit()
+
+        st.success(f"✅ {len(registros)} registros processados com sucesso!")
+
+        conn.commit()
+
+        st.success("✅ Importação concluída!")
+        st.write(f"➕ Inseridos: {inseridos}")
+        st.write(f"🔄 Atualizados: {atualizados}")
+
+# -------------------------
+# VISUALIZAÇÃO
+# -------------------------
+
+if menu == "Visualizar Base":
+
+    st.header("📋 Base Atual no Sistema")
+
+    df = pd.read_sql("SELECT * FROM base_colaboradores", conn)
+
+    if df.empty:
+        st.warning("Nenhum registro encontrado.")
+    else:
+        st.dataframe(df, use_container_width=True)
+# -------------------------
+# GESTÃO DE CAIXAS
+# -------------------------
+
+if menu == "Gestão de Caixas":
+
+    st.header("📦 Gestão de Caixas")
+
+    abas = st.tabs(["Criar Mês", "Criar Caixa", "Arquivar Funcionários"])
+
+    # -------------------------
+    # CRIAR MÊS
+    # -------------------------
+    with abas[0]:
+        mes = st.text_input("Mês referência (ex: 01-2026)")
+        if st.button("Salvar Mês"):
+            try:
+                cursor.execute("INSERT INTO meses (mes_referencia) VALUES (%s)", (mes,))
+                conn.commit()
+                st.success("Mês criado!")
+            except:
+                st.error("Mês já existe.")
+
+    # -------------------------
+    # CRIAR CAIXA
+    # -------------------------
+    with abas[1]:
+
+        meses = pd.read_sql("SELECT * FROM meses", conn)
+
+        if meses.empty:
+            st.warning("Cadastre um mês primeiro.")
+        else:
+            mes_opcoes = ["Todos"] + meses["id"].tolist()
+            mes_id = st.selectbox(
+                "Mês",
+                mes_opcoes,
+                format_func=lambda x: "Todos" if x == "Todos"
+                else meses.loc[meses["id"] == x, "mes_referencia"].values[0]
+            )
+            numero = st.text_input("Número da Caixa")
+            local = st.text_input("Localização")
+
+            if st.button("Criar Caixa"):
+                cursor.execute("""
+                    INSERT INTO caixas (numero_caixa, mes_id, localizacao)
+                    VALUES (%s,%s,%s)
+                """, (numero, mes_id, local))
+                conn.commit()
+                st.success("Caixa criada!")
+    # -------------------------
+    # ARQUIVAR FUNCIONÁRIOS
+    # -------------------------
+    with abas[2]:
+
+        meses = pd.read_sql("SELECT * FROM meses", conn)
+        base = pd.read_sql("SELECT * FROM base_colaboradores", conn)
+
+        if meses.empty or base.empty:
+            st.warning("Cadastre mês e base primeiro.")
+        else:
+
+            meses_ids = meses["id"].tolist()
+            index_padrao = 0
+            if st.session_state.memoria["mes_gestao"] in meses_ids:
+                index_padrao = meses_ids.index(st.session_state.memoria["mes_gestao"])
+            mes_id = st.selectbox(
+                "Mês",
+                meses_ids,
+                index=index_padrao,
+                format_func=lambda x: meses.loc[meses["id"] == x, "mes_referencia"].values[0]
+)
+            caixas_mes = pd.read_sql("SELECT * FROM caixas WHERE mes_id = %s", conn, params=(mes_id,))
+
+            if caixas_mes.empty:
+                st.warning("Nenhuma caixa criada para este mês.")
+            else:
+                caixas_ids = caixas_mes["id"].tolist()
+                index_caixa = 0
+                if st.session_state.memoria["caixa_gestao"] in caixas_ids:
+                    index_caixa = caixas_ids.index(st.session_state.memoria["caixa_gestao"])
+                caixa_id = st.selectbox(
+                    "Caixa",
+                    caixas_ids,
+                    index=index_caixa,
+                    format_func=lambda x: f"Caixa {caixas_mes.loc[caixas_mes['id']==x,'numero_caixa'].values[0]}"
+                )
+                st.session_state.memoria["caixa_gestao"] = caixa_id
+
+                contratos_lista = sorted(base["contrato"].dropna().unique().tolist())
+                index_contrato = 0
+                if st.session_state.memoria["contrato_gestao"] in contratos_lista:
+                    index_contrato = contratos_lista.index(st.session_state.memoria["contrato_gestao"])
+                contrato = st.selectbox(
+                        "Contrato",
+                            contratos_lista,
+                            index=index_contrato
+                        )
+                st.session_state.memoria["contrato_gestao"] = contrato
+
+                funcionarios = base[base["contrato"] == contrato].sort_values(by="matricula")
+
+                selecionados = st.multiselect(
+                "Selecionar funcionários arquivados",
+                funcionarios["matricula"],
+                format_func=lambda x: f"{x} - {funcionarios[funcionarios['matricula']==x]['nome'].values[0]}"
+            )
+                if st.button("Salvar Arquivamento"):
+                    registros = []
+
+                    for mat in selecionados:
+                        registros.append((
+                            mat,
+                            caixa_id,
+                            mes_id,
+                            datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                        ))
+
+                    query = """
+                    INSERT INTO cartoes_ponto
+                    (matricula, caixa_id, mes_id, data_registro)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (matricula, mes_id) DO NOTHING
+                    """
+
+                    execute_batch(cursor, query, registros, page_size=500)
+                    conn.commit()
+
+                    st.success("Processamento concluído!")
+
+# -------------------------
+# CONSULTAR ARQUIVAMENTOS
+# -------------------------
+
+if menu == "Consultar Arquivamentos":
+
+    st.header("📋 Consultar / Editar Arquivamentos")
+
+    meses = pd.read_sql("SELECT * FROM meses", conn)
+
+    if meses.empty:
+        st.warning("Nenhum mês cadastrado.")
+    else:
+        # -------------------------
+        # FILTRO MÊS (OBRIGATÓRIO)
+        # -------------------------
+        mes_opcoes = ["Todos"] + meses["id"].tolist()
+
+        mes_id = st.selectbox(
+            "Mês",
+            mes_opcoes,
+            format_func=lambda x: "Todos" if x == "Todos"
+            else meses.loc[meses["id"] == x, "mes_referencia"].values[0]
+        )
+
+        st.session_state.memoria["mes_consulta"] = mes_id
+        # -------------------------
+        # FILTRO CAIXA (OPCIONAL)
+        # -------------------------
+        caixas = pd.read_sql("SELECT * FROM caixas WHERE mes_id = %s", conn, params=(mes_id,))
         
-        if st.button("✅ SALVAR", type="primary"):
-            if fluig and mat:
-                try:
-                    sh = conectar_gsheets()
-                    ws = sh.worksheet("rescisões")
-                    
-                    # 1. PEGA CABEÇALHOS REAIS DO GOOGLE
-                    headers_planilha = [str(h).upper().strip() for h in ws.row_values(1)]
-                    
-                    # 2. Gera ID
-                    try:
-                        col_id_idx = headers_planilha.index("ID") + 1
-                        ids = ws.col_values(col_id_idx)
-                        # Filtra apenas números
-                        valid_ids = []
-                        for x in ids[1:]:
-                            if str(x).isdigit(): valid_ids.append(int(x))
-                        nid = max(valid_ids) + 1 if valid_ids else 1
-                    except: nid = 1
-                    
-                    # 3. CRIA O DICIONARIO DE DADOS (COM DATA BR)
-                    dados_registro = {
-                        'ID': nid,
-                        'FLUIG': f"'{fluig}",
-                        'MATRICULA': limpar_matricula(mat),
-                        'NOME': nm,
-                        'CPF': cpf,
-                        'PCD': pcd,
-                        'LOCACAO': lc,
-                        'DIAS_RECESSO': dr,
-                        'PERIODO_RECESSO': pr,
-                        'TIPO_DEMISSAO': tipo,
-                        'DATA_DEMISSAO': formatar_data_para_salvar(dt_dem), # AQUI VAI COMO DD/MM/AAAA
-                        'TEM_CONSIGNADO': "Sim" if vc > 0 else "Não",
-                        'VALOR_CONSIGNADO': str(vc).replace('.', ','),
-                        'CALCULO_REALIZADO': "PENDENTE",
-                        'DOC_ENVIADO': "PENDENTE",
-                        'DATA_PAGAMENTO': formatar_data_para_salvar(dt_dem + timedelta(days=10)),
-                        'FATURAMENTO': "NÃO",
-                        'BAIXA_PAGAMENTO': "ABERTO",
-                        'OBSERVACOES': str(obs),
-                        'EXCLUIR': ""
-                    }
-                    
-                    # 4. MAPEIA OS DADOS PARA AS COLUNAS REAIS DA PLANILHA
-                    linha_final = []
-                    for coluna in headers_planilha:
-                        # Se o nome da coluna no Excel existir no nosso dicionário, pega o valor
-                        # Se não, manda vazio
-                        valor = dados_registro.get(coluna, "")
-                        linha_final.append(valor)
-                    
-                    # 5. SALVA
-                    ws.append_row(linha_final)
-                    
-                    st.cache_data.clear(); st.success("SALVO!"); time.sleep(1); st.rerun()
-                except Exception as e: st.error(f"Erro: {e} - Verifique se a coluna DATA_DEMISSAO existe na planilha.")
-            else: st.error("Faltam dados")
+        caixa_opcoes = ["Todas"] + caixas["id"].tolist()
 
-    # --- TELA PRINCIPAL ---
-    st.title("Gerenciamento de Rescisões")
-    try:
-        sh = conectar_gsheets()
-        ws_res = sh.worksheet("rescisões")
-        df = pd.DataFrame(ws_res.get_all_records())
-    except: df = pd.DataFrame(columns=COLUNAS_FIXAS)
+        caixa_selecionada = st.selectbox(
+            "Caixa (opcional)",
+            caixa_opcoes,
+            format_func=lambda x: "Todas" if x == "Todas"
+            else f"Caixa {caixas.loc[caixas['id']==x,'numero_caixa'].values[0]}"
+        )
 
-    if df.empty: df = pd.DataFrame(columns=COLUNAS_FIXAS)
-    
-    # Normalização
-    df.columns = [str(c).upper().strip() for c in df.columns]
-    
-    # TRATAMENTO DE DATAS (LEITURA)
-    for col in ['DATA_DEMISSAO', 'DATA_PAGAMENTO']:
-        if col in df.columns:
-            # dayfirst=True para ler DD/MM/AAAA corretamente
-            df[col] = pd.to_datetime(df[col], errors='coerce', dayfirst=True).dt.date
+        # -------------------------
+        # FILTRO CONTRATO (OPCIONAL)
+        # -------------------------
+        base = pd.read_sql("SELECT * FROM base_colaboradores", conn)
+        contratos = ["Todos"] + sorted(base["contrato"].dropna().unique().tolist())
 
-    # TRATAMENTO GERAL
-    if 'FLUIG' in df: df['FLUIG'] = df['FLUIG'].astype(str).str.replace("'", "")
-    if 'MATRICULA' in df: df['MATRICULA'] = df['MATRICULA'].astype(str)
-    
-    bools = ['CALCULO_REALIZADO', 'DOC_ENVIADO', 'BAIXA_PAGAMENTO', 'FATURAMENTO', 'EXCLUIR']
-    for b in bools:
-        if b in df.columns:
-            df[b] = df[b].apply(interpretar_booleano)
+        contrato_selecionado = st.selectbox("Contrato (opcional)", contratos)
 
-    # FILTROS
-    st.markdown("#### 🔍 Filtros")
-    c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 2])
-    with c1: f_st = st.selectbox("Status", ["Todos", "Pendentes Cálculo", "Pendentes Doc", "Pendentes Pagto"])
-    with c2: f_dt = st.selectbox("Data", ["Ignorar", "Demissão", "Pagamento"])
-    with c3:
-        h = date.today()
-        di = st.date_input("De", h.replace(day=1), format="DD/MM/YYYY")
-        dfim = st.date_input("Até", h, format="DD/MM/YYYY")
-    with c4: busca = st.text_input("Buscar...")
-    
-    dfv = df.copy()
-    if f_st == "Pendentes Cálculo" and 'CALCULO_REALIZADO' in dfv: dfv = dfv[dfv['CALCULO_REALIZADO']==False]
-    elif f_st == "Pendentes Doc" and 'DOC_ENVIADO' in dfv: dfv = dfv[dfv['DOC_ENVIADO']==False]
-    elif f_st == "Pendentes Pagto" and 'BAIXA_PAGAMENTO' in dfv: dfv = dfv[dfv['BAIXA_PAGAMENTO']==False]
-    if f_dt != "Ignorar":
-        col = 'DATA_DEMISSAO' if f_dt == "Demissão" else 'DATA_PAGAMENTO'
-        if col in dfv:
-            dfv = dfv[dfv[col].notna()]
-            dfv = dfv[(dfv[col]>=di) & (dfv[col]<=dfim)]
-    if busca: dfv = dfv[dfv.astype(str).apply(lambda x: x.str.contains(busca, case=False, na=False)).any(axis=1)]
+        # -------------------------
+        # BUSCA POR NOME / MATRÍCULA
+        # -------------------------
+        busca = st.text_input("Buscar por nome ou matrícula")
 
-    # DASHBOARD
-    p_calc = len(dfv[dfv['CALCULO_REALIZADO']==False]) if 'CALCULO_REALIZADO' in dfv else 0
-    p_doc = len(dfv[dfv['DOC_ENVIADO']==False]) if 'DOC_ENVIADO' in dfv else 0
-    p_pag = len(dfv[dfv['BAIXA_PAGAMENTO']==False]) if 'BAIXA_PAGAMENTO' in dfv else 0
+        # -------------------------
+        # QUERY BASE
+        # -------------------------
+        query = """
+        SELECT cp.id, cp.matricula, b.nome, b.contrato,
+            c.numero_caixa, c.localizacao, cp.data_registro
+        FROM cartoes_ponto cp
+        LEFT JOIN base_colaboradores b ON cp.matricula = b.matricula
+        LEFT JOIN caixas c ON cp.caixa_id = c.id
+        WHERE 1=1
+        """
 
-    if p_calc > 0: st.error(f"🚨 **{p_calc}** cálculos pendentes!")
-    if p_doc > 0: st.warning(f"⚠️ **{p_doc}** envios pendentes!")
-    if p_pag > 0: st.info(f"💰 **{p_pag}** pagamentos abertos!")
+        params = []
+
+        if mes_id != "Todos":
+            query += " AND cp.mes_id = %s"
+            params.append(mes_id)
+
+
+        # Filtro Caixa
+        if caixa_selecionada != "Todas":
+            query += " AND cp.caixa_id = %s"
+            params.append(caixa_selecionada)
+
+        # Filtro Contrato
+        if contrato_selecionado != "Todos":
+            query += " AND b.contrato = %s"
+            params.append(contrato_selecionado)
+
+        df = pd.read_sql(query, conn, params=params)
+
+        # Filtro Busca
+        if busca:
+            df = df[
+                df["nome"].str.contains(busca, case=False, na=False) |
+                df["matricula"].str.contains(busca, case=False, na=False)
+            ]
+
+        if df.empty:
+            st.info("Nenhum arquivamento encontrado com esses filtros.")
+        else:
+            st.dataframe(df, use_container_width=True)
+
+            st.divider()
+            st.subheader("🗑 Excluir Arquivamento")
+
+            registro_id = st.selectbox("Selecionar ID para excluir", df["id"])
+
+            if st.button("Excluir Registro"):
+                cursor.execute("DELETE FROM cartoes_ponto WHERE id = %s", (registro_id,))
+                conn.commit()
+                st.success("Registro excluído com sucesso!")
+                cursor.execute("""
+                    INSERT INTO logs (usuario, acao, detalhe, data)
+                    VALUES (%s,%s,%s,%s)
+                """, (
+                    st.session_state.usuario_logado,
+                    "EXCLUSAO",
+                    f"Registro ID {registro_id}",
+                    datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+                ))
+                conn.commit()
+
+# -------------------------
+# MOTOR DE AUDITORIA V1
+# -------------------------
+
+if menu == "Auditoria":
+
+    st.header("🧠 Auditoria de Cartões")
+
+    meses = pd.read_sql("SELECT * FROM meses", conn)
+    base = pd.read_sql("SELECT * FROM base_colaboradores", conn)
+
+    if meses.empty:
+        st.warning("Cadastre meses primeiro.")
+        st.stop()
+
+    meses_ids = meses["id"].tolist()
+
+    index_padrao = 0
+    if st.session_state.memoria["mes_auditoria"] in meses_ids:
+        index_padrao = meses_ids.index(st.session_state.memoria["mes_auditoria"])
+
+    mes_id = st.selectbox(
+        "Mês para auditoria",
+        meses_ids,
+        index=index_padrao,
+        format_func=lambda x: meses.loc[meses["id"] == x, "mes_referencia"].values[0]
+    )
+
+    st.session_state.memoria["mes_auditoria"] = mes_id
+
+
+    mes_ref = meses.loc[meses["id"] == mes_id, "mes_referencia"].values[0]
+
+    # -------------------------
+    # CALCULAR PERÍODO 16 A 15
+    # -------------------------
+
+    mes, ano = mes_ref.split("/")
+    mes = int(mes)
+    ano = int(ano)
+
+    if mes == 1:
+        mes_anterior = 12
+        ano_anterior = ano - 1
+    else:
+        mes_anterior = mes - 1
+        ano_anterior = ano
+
+    data_inicio = datetime(ano_anterior, mes_anterior, 16)
+    data_fim = datetime(ano, mes, 15)
+
+    st.info(f"Período auditado: {data_inicio.strftime('%d-%m-%Y')} até {data_fim.strftime('%d-%m-%Y')}")
+
+    # -------------------------
+    # FILTRO CONTRATO
+    # -------------------------
+
+    contratos = sorted(base["contrato"].dropna().unique().tolist())
+    contrato_selecionado = st.selectbox("Contrato", contratos)
+
+    base_contrato = base[base["contrato"] == contrato_selecionado].copy()
+
+    # Converter datas
+    base_contrato["data_admissao"] = pd.to_datetime(base_contrato["data_admissao"], dayfirst=True, errors="coerce")
+    base_contrato["data_demissao"] = pd.to_datetime(base_contrato["data_demissao"], dayfirst=True, errors="coerce")
+
+    # -------------------------
+    # REGRA DE ATIVIDADE NO PERÍODO
+    # -------------------------
+
+    ativos_periodo = base_contrato[
+        (base_contrato["data_admissao"] <= data_fim) &
+        (
+            base_contrato["data_demissao"].isna() |
+            (base_contrato["data_demissao"] >= data_inicio)
+        )
+    ]
+
+    total_deveriam = len(ativos_periodo)
+
+    # -------------------------
+    # VERIFICAR ARQUIVADOS
+    # -------------------------
+
+    arquivados = pd.read_sql("""
+        SELECT matricula FROM cartoes_ponto
+        WHERE mes_id = %s
+    """, conn, params=(mes_id,))
+
+    arquivados_set = set(arquivados["matricula"].astype(str))
+
+    ativos_periodo["matricula"] = ativos_periodo["matricula"].astype(str)
+
+    ativos_periodo["arquivado"] = ativos_periodo["matricula"].isin(arquivados_set)
+
+    total_arquivados = ativos_periodo["arquivado"].sum()
+
+    faltando = ativos_periodo[ativos_periodo["arquivado"] == False]
+
+    # -------------------------
+    # RESULTADOS
+    # -------------------------
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Deveriam ter cartão", total_deveriam)
+    col2.metric("Arquivados", total_arquivados)
+    col3.metric("Faltando", total_deveriam - total_arquivados)
 
     st.divider()
-    st.caption(f"👁️ Visualizando: **{len(dfv)} registros**")
-    
-    # EDITOR
-    df_editado = st.data_editor(
-        dfv,
-        key="ed",
-        num_rows="fixed",
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "ID": st.column_config.NumberColumn(disabled=True, width="small"),
-            "FLUIG": st.column_config.TextColumn("Fluig", width="small"),
-            "MATRICULA": st.column_config.TextColumn("Matrícula", width="small"),
-            "NOME": st.column_config.TextColumn(disabled=True),
-            "CPF": st.column_config.TextColumn(disabled=True),
-            "PCD": st.column_config.TextColumn(disabled=True, width="small"),
-            "LOCACAO": st.column_config.TextColumn(disabled=True),
-            "DIAS_RECESSO": st.column_config.NumberColumn(disabled=True, width="small"),
-            "PERIODO_RECESSO": st.column_config.TextColumn(disabled=True),
-            "DATA_DEMISSAO": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "DATA_PAGAMENTO": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            "CALCULO_REALIZADO": st.column_config.CheckboxColumn("Cálc?"),
-            "DOC_ENVIADO": st.column_config.CheckboxColumn("Doc?"),
-            "BAIXA_PAGAMENTO": st.column_config.CheckboxColumn("Pago?"),
-            "FATURAMENTO": st.column_config.CheckboxColumn("Fat?"),
-            "EXCLUIR": st.column_config.CheckboxColumn("Excluir?")
-        }
+
+    if not faltando.empty:
+        st.error("⚠ Colaboradores sem cartão no período:")
+        st.dataframe(faltando[["matricula", "nome"]], use_container_width=True)
+    else:
+        st.success("Todos os cartões foram arquivados nesse contrato!")
+
+    st.warning(
+        "⚠ Esta auditoria considera:\n"
+        "- Contrato atual do colaborador\n"
+        "- Não considera histórico de transferências\n"
+        "- Não considera período exato de férias ou afastamento\n"
+        "Verifique manualmente casos específicos."
     )
     
-    c_save, c_del, c_exp = st.columns(3)
+# -------------------------
+# GESTÃO DE USUÁRIOS
+# -------------------------
 
-    # SALVAR
-    with c_save:
-        if 'confirm_save' not in st.session_state: st.session_state['confirm_save'] = False
-        if st.button("💾 SINCRONIZAR TUDO", type="primary"): st.session_state['confirm_save'] = True
+if menu == "Gestão de Usuários":
+
+    if st.session_state.perfil != "admin":
+        st.error("Acesso restrito ao administrador.")
+        st.stop()
+
+    st.header("👤 Gestão de Usuários")
+
+    abas = st.tabs(["Criar Usuário", "Listar Usuários"])
+
+    # -------------------------
+    # CRIAR
+    # -------------------------
+    with abas[0]:
+
         
-        if st.session_state['confirm_save']:
-            st.warning("Confirma envio?")
-            col_y, col_n = st.columns(2)
-            if col_y.button("SIM"):
-                try:
-                    ws_res = sh.worksheet("rescisões")
-                    df_g = pd.DataFrame(ws_res.get_all_records())
-                    if df_g.empty: df_g = pd.DataFrame(columns=COLUNAS_FIXAS)
-                    df_g.columns = [str(c).upper().strip() for c in df_g.columns]
-                    
-                    ids_t = df_editado['ID'].tolist()
-                    df_keep = df_g[~df_g['ID'].isin(ids_t)]
-                    df_new = df_editado.copy()
-                    
-                    # INTEGRIDADE
-                    for i, r in df_new.iterrows():
-                        nm, lc, cpf, pcd, vc, dr, pr = buscar_dados(str(r['MATRICULA']))
-                        if r['NOME'] != nm:
-                            df_new.at[i, 'NOME'] = nm; df_new.at[i, 'LOCACAO'] = lc
-                            df_new.at[i, 'CPF'] = cpf; df_new.at[i, 'PCD'] = pcd
-                            df_new.at[i, 'DIAS_RECESSO'] = dr; df_new.at[i, 'PERIODO_RECESSO'] = pr
-                    
-                    # FORMATAÇÃO (DATA BR NO UPDATE TB)
-                    if 'DATA_DEMISSAO' in df_new: df_new['DATA_DEMISSAO'] = df_new['DATA_DEMISSAO'].apply(formatar_data_para_salvar)
-                    if 'DATA_PAGAMENTO' in df_new: df_new['DATA_PAGAMENTO'] = df_new['DATA_PAGAMENTO'].apply(formatar_data_para_salvar)
-                    if 'FLUIG' in df_new: df_new['FLUIG'] = df_new['FLUIG'].astype(str).apply(lambda x: f"'{x}" if not str(x).startswith("'") else x)
+        novo_user = st.text_input("Usuário")
+        nova_senha = st.text_input("Senha", type="password")
+        perfil = st.selectbox("Perfil", ["admin", "usuario"])
 
-                    # TRADUÇÃO
-                    if 'CALCULO_REALIZADO' in df_new: df_new['CALCULO_REALIZADO'] = df_new['CALCULO_REALIZADO'].apply(lambda x: formatar_para_texto(x, 'CALCULO'))
-                    if 'DOC_ENVIADO' in df_new: df_new['DOC_ENVIADO'] = df_new['DOC_ENVIADO'].apply(lambda x: formatar_para_texto(x, 'DOC'))
-                    if 'BAIXA_PAGAMENTO' in df_new: df_new['BAIXA_PAGAMENTO'] = df_new['BAIXA_PAGAMENTO'].apply(lambda x: formatar_para_texto(x, 'PAGTO'))
-                    if 'FATURAMENTO' in df_new: df_new['FATURAMENTO'] = df_new['FATURAMENTO'].apply(lambda x: formatar_para_texto(x, 'FAT'))
-                    if 'EXCLUIR' in df_new: df_new['EXCLUIR'] = df_new['EXCLUIR'].apply(lambda x: formatar_para_texto(x, 'EXCLUIR'))
+        if st.button("Criar Usuário"):
+            try:
+                cursor.execute("""
+                    INSERT INTO usuarios (username, password, perfil)
+                    VALUES (%s,%s,%s)
+                """, (novo_user, nova_senha, perfil))
+                conn.commit()
+                st.success("Usuário criado com sucesso!")
+            except psycopg2.IntegrityError:
+                conn.rollback()
+                st.error("Usuário já existe.")
+    # -------------------------
+    # LISTAR
+    # -------------------------
+    with abas[1]:
 
-                    # Merge seguro
-                    df_fin = pd.concat([df_keep, df_new], ignore_index=True)
-                    df_fin['ID'] = pd.to_numeric(df_fin['ID'], errors='coerce').fillna(0).astype(int)
-                    df_fin = df_fin.sort_values('ID')
-                    
-                    # Ordena colunas
-                    cols_para_salvar = [c for c in COLUNAS_FIXAS if c in df_fin.columns]
-                    df_fin = df_fin[cols_para_salvar]
-                    
-                    df_fin = df_fin.replace([np.inf, -np.inf, np.nan], "").fillna("")
-                    matriz = [df_fin.columns.values.tolist()] + df_fin.astype(str).values.tolist()
-                    ws_res.clear()
-                    ws_res.update(matriz)
-                    
-                    st.cache_data.clear()
-                    st.session_state['confirm_save'] = False
-                    st.success("Sincronizado!"); time.sleep(1); st.rerun()
-                except Exception as e: st.error(f"Erro: {e}")
-            if col_n.button("NÃO"): st.session_state['confirm_save'] = False; st.rerun()
+        df_users = pd.read_sql("SELECT id, username, perfil FROM usuarios", conn)
 
-    # DELETAR
-    with c_del:
-        to_del = df_editado[df_editado['EXCLUIR'] == True]
-        if not to_del.empty:
-            if 'confirm_del' not in st.session_state: st.session_state['confirm_del'] = False
-            if st.button("🗑️ DELETAR"): st.session_state['confirm_del'] = True
-            if st.session_state['confirm_del']:
-                st.warning("Apagar?")
-                dy, dn = st.columns(2)
-                if dy.button("SIM"):
-                    ws_res = sh.worksheet("rescisões")
-                    df_g = pd.DataFrame(ws_res.get_all_records())
-                    df_g.columns = [str(c).upper().strip() for c in df_g.columns]
-                    ids = to_del['ID'].tolist()
-                    fin = df_g[~df_g['ID'].isin(ids)]
-                    
-                    # Garante que colunas existem
-                    valid_cols = [c for c in COLUNAS_FIXAS if c in fin.columns]
-                    fin = fin[valid_cols].replace([np.inf, -np.inf, np.nan], "").fillna("")
-                    
-                    matriz = [fin.columns.values.tolist()] + fin.astype(str).values.tolist()
-                    ws_res.clear(); ws_res.update(matriz)
-                    st.cache_data.clear(); st.session_state['confirm_del'] = False
-                    st.success("Feito!"); st.rerun()
-                if dn.button("CANCELAR"): st.session_state['confirm_del'] = False; st.rerun()
+        st.dataframe(df_users, use_container_width=True)
 
-    with c_exp:
-        dx = df.copy()
-        if 'CALCULO_REALIZADO' in dx: dx['CALCULO_REALIZADO'] = dx['CALCULO_REALIZADO'].apply(lambda x: formatar_para_texto(x, 'CALCULO'))
-        if 'DOC_ENVIADO' in dx: dx['DOC_ENVIADO'] = dx['DOC_ENVIADO'].apply(lambda x: formatar_para_texto(x, 'DOC'))
-        if 'BAIXA_PAGAMENTO' in dx: dx['BAIXA_PAGAMENTO'] = dx['BAIXA_PAGAMENTO'].apply(lambda x: formatar_para_texto(x, 'PAGTO'))
-        if 'FATURAMENTO' in dx: dx['FATURAMENTO'] = dx['FATURAMENTO'].apply(lambda x: formatar_para_texto(x, 'FAT'))
-        if 'DATA_DEMISSAO' in dx: dx['DATA_DEMISSAO'] = pd.to_datetime(dx['DATA_DEMISSAO']).dt.strftime('%d/%m/%Y')
-        csv = dx.to_csv(sep=';', decimal=',', index=False, encoding='utf-8-sig').encode('utf-8-sig')
-        st.download_button("📥 Excel", csv, "res.csv")
+        user_id = st.selectbox("Selecionar usuário para excluir", df_users["id"])
 
-elif pagina == "Gestão Usuários":
-    st.title("Admin")
-    c1, c2 = st.columns(2)
-    sh = conectar_gsheets()
-    ws_u = sh.worksheet("usuarios")
-    with c1:
-        st.subheader("Novo")
-        with st.form("new"):
-            nu = st.text_input("Login"); ns = st.text_input("Senha")
-            if st.form_submit_button("Criar"): ws_u.append_row([nu, ns]); st.success("Criado!")
-    with c2:
-        st.subheader("Ativos")
-        d = ws_u.get_all_records()
-        if d:
-            df_u = pd.DataFrame(d)
-            st.dataframe(df_u, use_container_width=True)
-            u_del = st.selectbox("Derrubar:", df_u['USUARIO'].tolist())
-            if st.button(f"🚫 EXCLUIR {u_del}"):
-                novos = df_u[df_u['USUARIO']!=u_del]
-                ws_u.clear(); ws_u.update([novos.columns.values.tolist()]+novos.values.tolist())
-                st.success("Feito!"); time.sleep(1); st.rerun()
+        if st.button("Excluir Usuário"):
+            cursor.execute("DELETE FROM usuarios WHERE id = %s", (user_id,))
+            conn.commit()
+            st.success("Usuário excluído!")
